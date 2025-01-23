@@ -5,6 +5,9 @@ import hashlib
 import base64
 import time
 import requests
+import lark_oapi as lark
+from requests_toolbelt import MultipartEncoder
+from lark_oapi.api.im.v1 import *
 from urllib.parse import quote_plus
 from common import log
 from flask import Flask, request, render_template, make_response
@@ -27,6 +30,7 @@ class FeiShuChannel(Channel):
         log.info("[FeiShu] app_id={}, app_secret={} verification_token={}".format(
             self.app_id, self.app_secret, self.verification_token))
         self.memory_store = MemoryStore()
+        self.cli = lark.Client.builder().app_id(self.app_id).app_secret(self.app_secret).build()
 
     def startup(self):
         http_app.run(host='0.0.0.0', port=channel_conf(
@@ -59,7 +63,25 @@ class FeiShuChannel(Channel):
             return ""
         return rsp_dict.get("tenant_access_token", "")
 
-    def notify_feishu(self, token, receive_type, receive_id, at_id, answer):
+    def extract_image_url(self, text):
+        """
+        从markdown格式的图片文本中提取URL
+        Args:
+            text: 形如 [!['IMAGE_CREATE'](url)](url) 的文本
+        Returns:
+            提取出的url,如果提取失败返回空字符串
+        """
+        try:
+            # 使用最简单的方式 - 提取第一个圆括号中的内容
+            start = text.find('(')
+            end = text.find(')', start)
+            if start != -1 and end != -1:
+                return text[start + 1:end]
+        except Exception as e:
+            log.error("extract_image_url error: {}", str(e))
+        return ""
+
+    def notify_feishu(self, token, receive_type, receive_id, at_id, answer, answer_type):
         log.info("notify_feishu.receive_type = {} receive_id={}",
                  receive_type, receive_id)
 
@@ -70,12 +92,33 @@ class FeiShuChannel(Channel):
         #     at_id, answer.lstrip()) or answer.lstrip()
         text = answer.lstrip()
         log.info("notify_feishu.text = {}", text)
+
+        img_key = ""
+        if answer_type == "IMAGE_CREATE":
+            image_url = self.extract_image_url(text)
+            log.info("notify_feishu.image_url = {}", image_url)
+            
+            # 上传图片到feishu
+            img_key = self.upload_image(image_url, token)
+            if img_key == "":
+                log.error("notify_feishu.upload_image error, img_key is empty")
+                return
+
+        msg_type = "text"
         msgContent = {
             "text": text,
         }
+        
+        # 准备图片回复
+        if img_key != "":
+            msg_type = "image"
+            msgContent = {
+                "image_key": img_key,
+            }
+
         req = {
             "receive_id": receive_id,  # chat id
-            "msg_type": "text",
+            "msg_type": msg_type,
             "content": json.dumps(msgContent),
         }
         payload = json.dumps(req)
@@ -131,7 +174,7 @@ class FeiShuChannel(Channel):
 
         context = dict()
         img_match_prefix = functions.check_prefix(
-            prompt, channel_conf_val(const.DINGTALK, 'image_create_prefix'))
+            prompt, channel_conf_val(const.FEISHU, 'image_create_prefix'))
         if img_match_prefix:
             prompt = prompt.split(img_match_prefix, 1)[1].strip()
             context['type'] = 'IMAGE_CREATE'
@@ -146,14 +189,42 @@ class FeiShuChannel(Channel):
             reply = images
         # 机器人 echo 收到的消息
         self.notify_feishu(access_token, receive_type,
-                           receive_id, at_id, reply)
+                           receive_id, at_id, reply, context['type'])
         return {'ret': 200}
 
     def handle_request_url_verify(self, post_obj):
         # 原样返回 challenge 字段内容
         challenge = post_obj.get("challenge", "")
         return {'challenge': challenge}
+    
+    def upload_image(self, image_url, token):
+        # 下载图片
+        resp = requests.get(image_url)
+        image_path = f"image_{time.time()}.jpg"
+        form = {'image_type': 'message'}
+        with open(image_path, 'wb') as f:
+            f.write(resp.content)
+            form['image'] = (image_path, open(image_path, 'rb'))
 
+        upload_url = "https://open.feishu.cn/open-apis/im/v1/images"
+        multi_form = MultipartEncoder(form)
+        headers = {'Authorization': f'Bearer {token}',
+                   'Content-Type': multi_form.content_type}
+        resp = requests.post(upload_url, headers=headers, data=multi_form)
+        res_data = json.loads(resp.content)
+        log.info("upload_image.resp={}", res_data)
+
+        code = res_data.get("code", -1)
+        if code != 0:
+         msg = res_data.get("msg","")
+         log.error("upload_image error, code = {}, msg = {}", code, msg)
+         return ""
+        
+        data = res_data.get("data",None)
+        if data is None:
+            log.error("upload_image error, data is None")
+            return ""
+        return data.get("image_key","")
 
 feishu = FeiShuChannel()
 http_app = Flask(__name__,)
