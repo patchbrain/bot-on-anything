@@ -161,16 +161,14 @@ http_app = Flask(__name__,)
 
 @http_app.route("/", methods=['POST'])
 def chat():
-    # log.info("[FeiShu] chat_headers={}".format(str(request.headers)))
+    log.info("[FeiShu] chat_headers={}".format(str(request.headers)))
     log.info("[FeiShu] chat={}".format(str(request.data)))
     obj = json.loads(request.data)
     if not obj:
         return {'ret': 201}
+        
     # 校验 verification token 是否匹配，token 不匹配说明该回调并非来自开发平台
-    headers = obj.get("header")
-    if not headers:
-        return {'ret': 201}
-    token = headers.get("token", "")
+    token = obj.get("token", "") or obj.get("header").get("token", "")
     if token != feishu.verification_token:
         log.error("verification token not match, token = {}", token)
         return {'ret': 201}
@@ -179,7 +177,7 @@ def chat():
     t = obj.get("type", "")
     if "url_verification" == t:  # 验证请求 URL 是否有效
         return feishu.handle_request_url_verify(obj)
-    elif headers.get("event_type", None) == "im.message.receive_v1":  # 事件回调
+    elif obj.get("header").get("event_type", None) == "im.message.receive_v1":  # 事件回调
         return feishu.handle(obj)
     return {'ret': 202}
     
